@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import json
 import time
+import os
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -87,7 +88,6 @@ class DBConnection:
 
 # Тестовый запуск для проверки получения сайтов
 if __name__ == '__main__':
-    import os
     from dotenv import load_dotenv
     from logs.logger import setup_logger
 
