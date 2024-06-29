@@ -16,6 +16,7 @@ class TelegramBot:
             await self.bot.send_message(chat_id=self.channel_id, text=html.quote(message))
             self.delay = 1  # Reset delay after successful send
         except TelegramRetryAfter as e:
+            print('TelegramRetryAfter', e)
             # Too many requests, need to wait
             self.delay = e.retry_after + 2
             self.message_queue.appendleft(message)  # Re-add the message to the front of the queue
@@ -37,3 +38,17 @@ class TelegramBot:
     async def start_polling(self):
         asyncio.create_task(self.process_queue())
         await self.dp.start_polling(self.bot)
+
+async def test_TelegramRetryAfter():
+    from dotenv import load_dotenv
+    import os
+    load_dotenv()
+    TOKEN = os.getenv('TOKEN')
+    CHAT_ID = os.getenv('CHAT_ID')
+    telegram_bot = TelegramBot(token=TOKEN, channel_id=CHAT_ID)
+    for i in range(1000):
+        telegram_bot.add_to_queue(f"Test message {i}")
+    await telegram_bot.start_polling()
+
+if __name__ == '__main__':
+    asyncio.run(test_TelegramRetryAfter())
