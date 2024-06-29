@@ -97,6 +97,7 @@ class UptimeMonitor:
             await asyncio.gather(*tasks)
             await asyncio.sleep(self.INTERVAL_BETWEEN_CHECKING)
     async def main(self):
+        await self.db.init_db()
         asyncio.create_task(self.uptime_check())
         await self.telegram_bot.start_polling()
 
