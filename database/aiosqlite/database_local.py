@@ -1,8 +1,6 @@
 import aiosqlite
 
-
 DATABASE = 'database/aiosqlite/uptime.db'
-
 class Database:
     def __init__(self, db_path=DATABASE):
         self.db_path = db_path
