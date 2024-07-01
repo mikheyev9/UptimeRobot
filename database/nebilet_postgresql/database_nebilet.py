@@ -1,11 +1,10 @@
-from contextlib import contextmanager
-import json
-import time
+import asyncpg
 import os
-
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
+import json
+import asyncio
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+from logs.logger import setup_logger
 
 class DBConnection:
     def __init__(self, host, port, user, password, database,
@@ -21,8 +20,7 @@ class DBConnection:
         self.retry_attempts = retry_attempts
         self.retry_delay = retry_delay
         self.backup_file = self._get_backup_path(backup_file)
-        self.connection = None
-        self.cursor = None
+        self.pool = None
 
     @staticmethod
     def _get_backup_path(name):
@@ -31,46 +29,61 @@ class DBConnection:
         backup_file_path = os.path.join(current_directory, name)
         return backup_file_path
 
-    def connect_db(self):
+    async def connect_db(self):
         for attempt in range(self.retry_attempts):
             try:
-                self.connection = psycopg2.connect(user=self.user,
-                                                   password=self.password,
-                                                   host=self.host,
-                                                   port=self.port,
-                                                   database=self.database)
-                self.cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+                self.pool = await asyncpg.create_pool(user=self.user,
+                                                      password=self.password,
+                                                      host=self.host,
+                                                      port=self.port,
+                                                      database=self.database)
                 return True
-            except psycopg2.OperationalError as e:
+            except (asyncpg.PostgresError, OSError) as e:
                 if attempt < self.retry_attempts - 1:
-                    time.sleep(self.retry_delay)
+                    await asyncio.sleep(self.retry_delay)
                 else:
+                    self.logger.error(f"Could not connect to the database after {self.retry_attempts} attempts.")
                     return False
 
-    @contextmanager
-    def get_cursor(self):
-        with self.connection.cursor(cursor_factory=RealDictCursor) as cursor:
-            yield cursor
+    @asynccontextmanager
+    async def get_cursor(self):
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                yield connection
 
-    def get_sites(self):
-        if self.use_json or not self.connect_db():
+    async def get_sites(self):
+        if self.use_json or not await self.connect_db():
             return self.load_backup_data()
         try:
-            with self.get_cursor() as cursor:
-                cursor.execute('SELECT name FROM public.tables_sites WHERE site_check=True')
-                sites = ['https://' + row['name'] for row in cursor.fetchall()]
+            async with self.get_cursor() as conn:
+                sites = await conn.fetch('SELECT name FROM public.tables_sites WHERE site_check=True')
+                sites = ['https://' + row['name'] for row in sites]
                 self.save_backup_data(sites)
                 return sites
-        except (Exception, psycopg2.DatabaseError) as e:
-            logger.error(f"Error fetching sites from the database")
+        except (Exception, asyncpg.PostgresError) as e:
+            self.logger.error(f"Error fetching sites from the database: {e}")
             return self.load_backup_data()
+
+    async def is_site_check_enabled(self, domain):
+        domain = domain.replace('https://', '').replace('http://', '')
+        query = 'SELECT site_check FROM public.tables_sites WHERE name=$1'
+        try:
+            async with self.get_cursor() as conn:
+                result = await conn.fetchrow(query, domain)
+                if result:
+                    return result['site_check']
+                return False
+        except (Exception, asyncpg.PostgresError) as e:
+            self.logger.error(f"Error checking site_check for domain {domain}: {e}")
+            return False
 
     def save_backup_data(self, data):
         try:
             with open(self.backup_file, 'w') as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Error saving backup data: {e}")
+
     def load_backup_data(self):
         try:
             with open(self.backup_file, 'r') as f:
@@ -79,18 +92,13 @@ class DBConnection:
         except FileNotFoundError:
             return []
 
-    def close(self):
-        if self.cursor:
-            self.cursor.close()
-        if self.connection:
-            self.connection.close()
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
 
 
-# Тестовый запуск для проверки получения сайтов
-if __name__ == '__main__':
-    from dotenv import load_dotenv
-    from logs.logger import setup_logger
 
+async def main():
     logger = setup_logger(
         'test_nebilet_postgresql.log',
         logger_name='test_nebilet_postgresql'
@@ -112,9 +120,19 @@ if __name__ == '__main__':
         logger=logger
     )
 
-    sites = db_connection.get_sites()
-    print(f"Retrieved {len(sites)} sites from the database or backup.")
-    for site in sites:
-        print(site)
+    try:
+        # Ensure the pool is connected
+        await db_connection.connect_db()
 
-    db_connection.close()
+        # Get sites
+        sites = await db_connection.get_sites()
+        print(f"Retrieved {len(sites)} sites from the database or backup.")
+        for site in sites:
+            print(site)
+    except Exception as e:
+        logger.error(f"Error during database operation: {e}")
+    finally:
+        await db_connection.close()
+
+if __name__ == '__main__':
+    asyncio.run(main())
