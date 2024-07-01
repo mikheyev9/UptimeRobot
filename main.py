@@ -85,7 +85,8 @@ class UptimeMonitor:
             await self.db.log_status(url, status, response_time, checked_at)
             error_message = self._create_error_message(url, status, error)
             self.telegram_bot.add_to_queue(error_message)
-            asyncio.create_task(self.check_site_until_up(url))
+            if url not in self.down_since:
+                asyncio.create_task(self.check_site_until_up(url))
         else:
             await self.db.log_status(url, status, response_time, checked_at)
         logger.info(f"{url} {status} {response_time} {checked_at}")
