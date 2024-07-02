@@ -50,12 +50,14 @@ class UptimeMonitor:
     def _create_disabled_message(self, url):
         return f"⚫ Monitor is DISABLED for: {url}. The check has been turned off."
 
+    def _create_exception_message(self, url, exception):
+        return f"⚠️ An exception occurred while processing {url}: {str(exception)[:100]}..."
+
     def _calculate_downtime(self, url):
         downtime = datetime.utcnow() - self.down_since.get(url, datetime.utcnow())
         if downtime < timedelta(0):
             downtime = timedelta(0)
         return str(downtime).split('.')[0]
-
 
     async def check_site_until_up(self, url):
         self.down_since.setdefault(url, datetime.utcnow())
@@ -63,48 +65,59 @@ class UptimeMonitor:
         await asyncio.sleep(self.DELAY_WAIT_BEFORE_START_RETRYING)
 
         while True:
+            try:
+                if not await self.db_connection.is_site_check_enabled(url):
+                    disabled_message = self._create_disabled_message(url)
+                    self.telegram_bot.add_to_queue(disabled_message)
+                    logger.info(disabled_message)
+                    break
 
-            if not await self.db_connection.is_site_check_enabled(url):
-                disabled_message = self._create_disabled_message(url)
-                self.telegram_bot.add_to_queue(disabled_message)
-                logger.info(disabled_message)
-                break
+                url, status, response_time, checked_at, error = await check_website(
+                    url,
+                    self.RETRIES_IN_REPEATING_REQUESTS
+                )
 
+                if status == 200:
+                    downtime = self._calculate_downtime(url)
+                    await self.db.log_status(url, status, response_time, checked_at)
+                    success_message = self._create_success_message(url, downtime)
+                    self.telegram_bot.add_to_queue(success_message)
+                    logger.info(f"{url} is back up. Downtime: {downtime}")
+                    del self.down_since[url]
+                    break
+                else:
+                    error_message = self._create_error_message(url, status, error)
+                    self.telegram_bot.add_to_queue(error_message)
+                    await asyncio.sleep(self.TIME_WAIT_BEFORE_RETRYING + current_wait_time)
+                    current_wait_time += 5
+
+            except Exception as e:
+                logger.error(f"An error occurred while checking {url}: {str(e)}")
+                exception_message = self._create_exception_message(url, e)
+                self.telegram_bot.add_to_queue(exception_message)
+                await asyncio.sleep(self.TIME_WAIT_BEFORE_RETRYING + current_wait_time)
+                current_wait_time += 5
+
+    async def process_website_check(self, url):
+        try:
             url, status, response_time, checked_at, error = await check_website(
                 url,
                 self.RETRIES_IN_REPEATING_REQUESTS
             )
-
-            if status == 200:
-                downtime = self._calculate_downtime(url)
+            if status != 200:
                 await self.db.log_status(url, status, response_time, checked_at)
-                success_message = self._create_success_message(url, downtime)
-                self.telegram_bot.add_to_queue(success_message)
-                logger.info(f"{url} is back up. Downtime: {downtime}")
-                del self.down_since[url]
-                break
-
-            else:
                 error_message = self._create_error_message(url, status, error)
                 self.telegram_bot.add_to_queue(error_message)
-                await asyncio.sleep(self.TIME_WAIT_BEFORE_RETRYING + current_wait_time)
-                current_wait_time += 5
+                if url not in self.down_since:
+                    asyncio.create_task(self.check_site_until_up(url))
+            else:
+                await self.db.log_status(url, status, response_time, checked_at)
+            logger.info(f"{url} {status} {response_time} {checked_at}")
 
-
-    async def process_website_check(self, url):
-        url, status, response_time, checked_at, error = await check_website(
-            url,
-            self.RETRIES_IN_REPEATING_REQUESTS
-        )
-        if status != 200:
-            await self.db.log_status(url, status, response_time, checked_at)
-            error_message = self._create_error_message(url, status, error)
-            self.telegram_bot.add_to_queue(error_message)
-            if url not in self.down_since:
-                asyncio.create_task(self.check_site_until_up(url))
-        else:
-            await self.db.log_status(url, status, response_time, checked_at)
-        logger.info(f"{url} {status} {response_time} {checked_at}")
+        except Exception as e:
+            logger.error(f"An error occurred while processing {url}: {str(e)}")
+            exception_message = self._create_exception_message(url, e)
+            self.telegram_bot.add_to_queue(exception_message)
 
 
     async def uptime_check(self):
