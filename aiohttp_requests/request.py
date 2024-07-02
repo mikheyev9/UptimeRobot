@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 
 import aiohttp
@@ -11,7 +11,7 @@ async def check_website(url,
     async with aiohttp.ClientSession() as session:
         for attempt in range(retries):
             start_time = time.time()
-            checked_at = datetime.utcnow().isoformat()
+            checked_at = datetime.now(timezone.utc).isoformat()
             try:
                 async with session.get(url, timeout=10) as response:
                     response_time = time.time() - start_time
@@ -23,10 +23,8 @@ async def check_website(url,
                 response_time = time.time() - start_time
                 status = 'Exception'
                 error = str(ex)
-                if attempt < retries - 1:
-                    await asyncio.sleep(delays[attempt])
-                else:
-                    return url, status, response_time, checked_at, error
+                await asyncio.sleep(delays[attempt])
+            return url, status, response_time, checked_at, error
 
 
 # Пример использования функции

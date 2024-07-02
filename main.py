@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import asyncio
 from dotenv import load_dotenv
@@ -54,13 +54,13 @@ class UptimeMonitor:
         return f"⚠️ An exception occurred while processing {url}: {str(exception)[:100]}..."
 
     def _calculate_downtime(self, url):
-        downtime = datetime.utcnow() - self.down_since.get(url, datetime.utcnow())
+        downtime = datetime.now(timezone.utc) - self.down_since.get(url, datetime.now(timezone.utc))
         if downtime < timedelta(0):
             downtime = timedelta(0)
         return str(downtime).split('.')[0]
 
     async def check_site_until_up(self, url):
-        self.down_since.setdefault(url, datetime.utcnow())
+        self.down_since.setdefault(url, datetime.now(timezone.utc))
         current_wait_time = 0
         await asyncio.sleep(self.DELAY_WAIT_BEFORE_START_RETRYING)
 
