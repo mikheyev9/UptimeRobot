@@ -147,7 +147,6 @@ class UptimeMonitor:
         tasks = [self.process_website_check(url, session) for url in self.urls]
         await asyncio.gather(*tasks)
         await session.close()
-        print('session closed')
 
     async def uptime_check(self):
         while True:
