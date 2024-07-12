@@ -205,7 +205,7 @@ if __name__ == '__main__':
         interval_between_checking=800,
         time_wait_before_retrying=80,
         delay_wait_before_start_retrying=35,
-        retries_in_repeated_requests=5,
+        retries_in_repeated_requests=3,
         pool_size=50,
         limit_per_host=1,
         limit_request_ip=1

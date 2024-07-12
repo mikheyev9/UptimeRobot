@@ -17,7 +17,6 @@ async def check_website(url,
                         domain,
                         session,
                         proxies,
-                        use_proxy=False,
                         retries_in_repeated_requests=3,
                         delay_wait_before_start_retrying=3,
                         ):
@@ -41,10 +40,10 @@ async def check_website(url,
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": "\"Linux\""
     }
-    proxy = proxies[0] if use_proxy is False else None
     for attempt in range(retries_in_repeated_requests):
         start_time = time.time()
         checked_at = datetime.now(timezone.utc).isoformat()
+        proxy = None
         try:
             async with session.get(url, headers=headers, timeout=15, proxy=proxy) as response:
                 response_time = time.time() - start_time
@@ -52,8 +51,6 @@ async def check_website(url,
                 error = None
                 if status == 200:
                     return url, status, response_time, checked_at, error
-                logger.info(f"{url} {status} {response_time} {checked_at} {error if error else ''} "
-                            f"use proxy {proxy}")
         except Exception as ex:
             response_time = time.time() - start_time
             status = 'Exception'
@@ -63,7 +60,7 @@ async def check_website(url,
             logger.info(f"{url} {status} {response_time} {checked_at} {error if error else ''} "
                         f"use proxy {proxy}")
             await asyncio.sleep(delays[attempt])
-        return url, status, response_time, checked_at, error
+    return url, status, response_time, checked_at, error
 
 
 # Пример использования функции
