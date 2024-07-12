@@ -21,8 +21,8 @@ async def check_website(url,
                         retries_in_repeated_requests=3,
                         delay_wait_before_start_retrying=3,
                         ):
-    retries = retries_in_repeated_requests
-    delays = [i + delay_wait_before_start_retrying for i in range(retries)]
+    delays = [i + delay_wait_before_start_retrying
+                for i in range(retries_in_repeated_requests)]
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Encoding": "gzip, deflate, br, zstd",
@@ -42,7 +42,7 @@ async def check_website(url,
         "sec-ch-ua-platform": "\"Linux\""
     }
     proxy = proxies[0] if use_proxy is False else None
-    for attempt in range(retries):
+    for attempt in range(retries_in_repeated_requests):
         start_time = time.time()
         checked_at = datetime.now(timezone.utc).isoformat()
         try:
@@ -52,6 +52,8 @@ async def check_website(url,
                 error = None
                 if status == 200:
                     return url, status, response_time, checked_at, error
+                logger.info(f"{url} {status} {response_time} {checked_at} {error if error else ''} "
+                            f"use proxy {proxy}")
         except Exception as ex:
             response_time = time.time() - start_time
             status = 'Exception'
