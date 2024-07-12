@@ -1,14 +1,26 @@
 import asyncio
+import random
 from datetime import datetime, timezone
 import time
 
 import aiohttp
 
+from logs.logger import logger
+
+async def create_session(pool_size, limit_per_host):
+    connector = aiohttp.TCPConnector(limit=pool_size,
+                                     limit_per_host=limit_per_host)
+    session = aiohttp.ClientSession(connector=connector)
+    return session
+
 async def check_website(url,
                         domain,
                         session,
+                        proxies,
+                        use_proxy=False,
                         retries_in_repeated_requests=3,
-                        delay_wait_before_start_retrying=3):
+                        delay_wait_before_start_retrying=3,
+                        ):
     retries = retries_in_repeated_requests
     delays = [i + delay_wait_before_start_retrying for i in range(retries)]
     headers = {
@@ -29,11 +41,12 @@ async def check_website(url,
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": "\"Linux\""
     }
+    proxy = proxies[0] if use_proxy is False else None
     for attempt in range(retries):
         start_time = time.time()
         checked_at = datetime.now(timezone.utc).isoformat()
         try:
-            async with session.get(url, headers=headers, timeout=15) as response:
+            async with session.get(url, headers=headers, timeout=15, proxy=proxy) as response:
                 response_time = time.time() - start_time
                 status = response.status
                 error = None
@@ -43,6 +56,10 @@ async def check_website(url,
             response_time = time.time() - start_time
             status = 'Exception'
             error = str(ex)
+            if len(proxies) > 0:
+                proxy = random.choice(proxies)
+            logger.info(f"{url} {status} {response_time} {checked_at} {error if error else ''} "
+                        f"use proxy {proxy}")
             await asyncio.sleep(delays[attempt])
         return url, status, response_time, checked_at, error
 
