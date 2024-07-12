@@ -1,6 +1,8 @@
 import aiohttp
 import os
 from datetime import datetime, timedelta, timezone
+import socket
+from urllib.parse import urlparse
 
 import asyncio
 from dotenv import load_dotenv
@@ -28,7 +30,8 @@ class UptimeMonitor:
                  delay_wait_before_start_retrying=5,
                  retries_in_repeated_requests=3,
                  pool_size=100,
-                 limit_per_host=4):
+                 limit_per_host=4,
+                 limit_request_ip=1):
         self.token = token
         self.chat_id = chat_id
         self.db = Database()
@@ -43,7 +46,9 @@ class UptimeMonitor:
         self.RETRIES_IN_REPEATING_REQUESTS = retries_in_repeated_requests
         self.POOL_SIZE = pool_size
         self.LIMIT_PER_HOST = limit_per_host
+        self.LIMIT_REQUEST_IP = limit_request_ip
         self.down_since = {}
+        self.ip_semaphores = {}
 
     def _create_success_message(self, url, downtime):
         return f"🟢 Monitor is UP: {url} ( {url} ). It was down for {downtime}."
@@ -76,7 +81,7 @@ class UptimeMonitor:
         session = aiohttp.ClientSession(connector=connector)
         return session
 
-    async def check_site_until_up(self, url):
+    async def check_site_until_up(self, url, domain):
         self.down_since.setdefault(url, datetime.now(timezone.utc))
         session = await self.create_session()
         current_wait_time = 0
@@ -92,6 +97,7 @@ class UptimeMonitor:
 
                 url, status, response_time, checked_at, error = await check_website(
                     url,
+                    domain,
                     session,
                     self.RETRIES_IN_REPEATING_REQUESTS,
                     self.DELAY_WAIT_BEFORE_START_RETRYING
@@ -112,7 +118,6 @@ class UptimeMonitor:
                     current_wait_time += self.DELAY_WAIT_BEFORE_START_RETRYING
                     logger.info(f"{url} {status} {response_time} {checked_at} {error if error else ''}")
 
-
             except Exception as e:
                 logger.error(f"An error occurred while checking {url}: {str(e)}")
                 exception_message = self._create_exception_message(url, e)
@@ -122,25 +127,41 @@ class UptimeMonitor:
         await session.close()
 
     async def process_website_check(self, url, session):
-        try:
-            url, status, response_time, checked_at, error = await check_website(
-                url,
-                session,
-                self.RETRIES_IN_REPEATING_REQUESTS,
-                self.DELAY_WAIT_BEFORE_START_RETRYING
-            )
-            if status != 200:
-                error_message = self._create_error_message(url, status, error)
-                self.telegram_bot.add_to_queue(error_message)
-                if url not in self.down_since:
-                    asyncio.create_task(self.check_site_until_up(url))
-            await self.log_status_in_sqlite(url, status, response_time, checked_at)
-            logger.info(f"{url} {status} {response_time} {checked_at} {error if error else ''}")
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc
+        semaphore = self.get_semaphore(domain)
+        async with semaphore:
+            try:
+                url, status, response_time, checked_at, error = await check_website(
+                    url,
+                    domain,
+                    session,
+                    self.RETRIES_IN_REPEATING_REQUESTS,
+                    self.DELAY_WAIT_BEFORE_START_RETRYING
+                )
+                if status != 200:
+                    error_message = self._create_error_message(url, status, error)
+                    self.telegram_bot.add_to_queue(error_message)
+                    if url not in self.down_since:
+                        asyncio.create_task(self.check_site_until_up(url, domain))
+                await self.log_status_in_sqlite(url, status, response_time, checked_at)
+                logger.info(f"{url} {status} {response_time} {checked_at} {error if error else ''}")
 
-        except Exception as e:
-            logger.error(f"An error occurred while processing {url}: {str(e)}")
-            exception_message = self._create_exception_message(url, e)
-            self.telegram_bot.add_to_queue(exception_message)
+            except Exception as e:
+                logger.error(f"An error occurred while processing {url}: {str(e)}")
+                exception_message = self._create_exception_message(url, e)
+                self.telegram_bot.add_to_queue(exception_message)
+
+    def get_ip(self, domain):
+        try:
+            return socket.gethostbyname(domain)
+        except socket.gaierror:
+            return None
+    def get_semaphore(self, domain):
+        ip = self.get_ip(domain)
+        if ip not in self.ip_semaphores:
+            self.ip_semaphores[ip] = asyncio.Semaphore(self.LIMIT_REQUEST_IP)
+        return self.ip_semaphores[ip]
 
     async def check_all_websites(self):
         session = await self.create_session()
@@ -180,6 +201,7 @@ if __name__ == '__main__':
         time_wait_before_retrying=80,
         delay_wait_before_start_retrying=35,
         pool_size=50,
-        limit_per_host=1
+        limit_per_host=1,
+        limit_request_ip=1
     )
     asyncio.run(monitor.main())
