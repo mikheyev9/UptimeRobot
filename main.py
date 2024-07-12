@@ -178,8 +178,8 @@ if __name__ == '__main__':
         need_saving_in_local_db=False,
         interval_between_checking=800,
         time_wait_before_retrying=80,
-        delay_wait_before_start_retrying=15,
+        delay_wait_before_start_retrying=35,
         pool_size=50,
-        limit_per_host=3
+        limit_per_host=1
     )
     asyncio.run(monitor.main())
