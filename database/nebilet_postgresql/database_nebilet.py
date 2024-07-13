@@ -1,14 +1,24 @@
 import asyncpg
 import os
 import json
+
 import asyncio
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+
 from logs.logger import setup_logger
 
 class DBConnection:
-    def __init__(self, host, port, user, password, database,
-                 logger, use_json=False, retry_attempts=5, retry_delay=5,
+    def __init__(self,
+                 host,
+                 port,
+                 user,
+                 password,
+                 database,
+                 logger,
+                 use_json=False,
+                 retry_attempts=5,
+                 retry_delay=5,
                  backup_file='backup_sites.json'):
         self.host = host
         self.port = str(port)
@@ -43,16 +53,18 @@ class DBConnection:
                     await asyncio.sleep(self.retry_delay)
                 else:
                     self.logger.error(f"Could not connect to the database after {self.retry_attempts} attempts.")
-                    return False
+                    raise ConnectionError("Failed to connect to the database.")
 
     @asynccontextmanager
     async def get_cursor(self):
-        async with self.pool.acquire() as connection:
+        if not self.pool:
+            await self.connect_db()
+        async with self.pool.acquire(timeout=30) as connection:
             async with connection.transaction():
                 yield connection
 
     async def get_sites(self):
-        if self.use_json or not await self.connect_db():
+        if self.use_json:
             return self.load_backup_data()
         try:
             async with self.get_cursor() as conn:
