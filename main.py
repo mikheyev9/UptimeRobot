@@ -1,16 +1,24 @@
 import os
-from datetime import datetime, timedelta, timezone
-import socket
-from urllib.parse import urlparse
+from datetime import datetime, timezone
+from typing import Optional
 
 import asyncio
 from dotenv import load_dotenv
 
-from aiohttp_requests.request import check_website, create_session
+from aiohttp_requests.request import (WebsiteChecker,
+                                      create_session,
+                                      get_domain_from_url,
+                                      resolve_domain)
+from aiohttp_requests.proxy import ProxyManager
 from telegram.telegram_bot import TelegramBot
 from database.aiosqlite.database_local import Database
 from database.nebilet_postgresql.database_nebilet import DBConnection
 from logs.logger import logger
+from logs.logger_message import (create_message_site_is_up,
+                                 create_error_message,
+                                 create_disabled_message,
+                                 create_exception_message)
+from tools.time_tools import calculate_downtime
 
 load_dotenv()
 TOKEN = os.getenv('TOKEN')
@@ -21,8 +29,13 @@ DB_PORT = os.getenv('DB_PORT')
 DB_USER = os.getenv('DB_USER')
 DB_PASSWORD = os.getenv('DB_PASSWORD')
 DB_DATABASE = os.getenv('DB_DATABASE')
+
+
 class UptimeMonitor:
-    def __init__(self, token, chat_id, db_connection,
+    def __init__(self,
+                 token,
+                 chat_id,
+                 db_connection,
                  need_saving_in_local_db=False,
                  interval_between_checking=800,
                  time_wait_before_retrying=80,
@@ -30,11 +43,13 @@ class UptimeMonitor:
                  retries_in_repeated_requests=3,
                  pool_size=100,
                  limit_per_host=4,
-                 limit_request_ip=1):
+                 limit_request_ip=1,
+                 proxy_check_interval=5):
         self.token = token
         self.chat_id = chat_id
         self.db = Database()
         self.need_saving_in_local_db = need_saving_in_local_db
+        self.proxy_manager = ProxyManager(check_interval=proxy_check_interval)
         self.telegram_bot = TelegramBot(token=self.token, channel_id=self.chat_id)
         self.db_connection = db_connection
         self.urls = []
@@ -49,141 +64,103 @@ class UptimeMonitor:
         self.down_since = {}
         self.ip_semaphores = {}
 
-    def _create_success_message(self, url, downtime):
-        return f"🟢 Monitor is UP: {url} ( {url} ). It was down for {downtime}."
-
-    def _create_error_message(self, url, status, error=None):
-        downtime = self._calculate_downtime(url)
-        message = f"🔴 Monitor is DOWN: {url} (Status: {status}). Down for: {downtime}."
-        if error:
-            message += f" Error: {error[:100]}..."
-        return message
-
-    def _create_disabled_message(self, url):
-        return f"⚫ Monitor is DISABLED for: {url}. The check has been turned off."
-
-    def _create_exception_message(self, url, exception):
-        return f"⚠️ An exception occurred while processing {url}: {str(exception)[:100]}..."
-
-    def _calculate_downtime(self, url):
-        downtime = datetime.now(timezone.utc) - self.down_since.get(url, datetime.now(timezone.utc))
-        if downtime < timedelta(0):
-            downtime = timedelta(0)
-        return str(downtime).split('.')[0]
-
-    async def log_status_in_sqlite(self, url, status, response_time, checked_at):
+    async def log_status_in_sqlite(self, url, status, response_time, checked_at) -> None:
         if self.need_saving_in_local_db:
             await self.db.log_status(url, status, response_time, checked_at)
 
+    async def process_website_check(self, url, session) -> None:
+        semaphore = await self.get_semaphore(url)
+        async with semaphore:
+            try:
+                checker = WebsiteChecker(
+                    url,
+                    self.proxy_manager,
+                    self.RETRIES_IN_REPEATING_REQUESTS,
+                    self.DELAY_WAIT_BEFORE_START_RETRYING,
+                    session
+                )
+                url, status, response_time, checked_at, error = await checker.check_website()
+                if status != 200:
+                    if url not in self.down_since:
+                        error_message = create_error_message(url, status, error)
+                        await self.telegram_bot.add_to_queue(error_message)
+                        self.down_since.setdefault(url, datetime.now(timezone.utc))
+                        asyncio.create_task(self.check_site_until_up(url))
 
-    async def check_site_until_up(self, url, domain, proxies):
-        self.down_since.setdefault(url, datetime.now(timezone.utc))
-        session = await create_session(self.POOL_SIZE, self.LIMIT_PER_HOST)
-        current_wait_time = 0
+                await self.log_status_in_sqlite(url, status, response_time, checked_at)
+                logger.info(f"{url} {status} {response_time} {error if error else ''}")
+
+            except Exception as e:
+                await self._send_debug_exception_message(url, e)
+
+    async def check_site_until_up(self, url):
         await asyncio.sleep(self.DELAY_WAIT_BEFORE_START_RETRYING)
 
         while True:
             try:
-                if not await self.db_connection.is_site_check_enabled(url):
-                    disabled_message = self._create_disabled_message(url)
-                    self.telegram_bot.add_to_queue(disabled_message)
+                if not await self.db_connection.domain_in_production(url):
+                    disabled_message = create_disabled_message(url)
+                    await self.telegram_bot.add_to_queue(disabled_message)
                     logger.info(disabled_message)
-                    break
+                    return
 
-                url, status, response_time, checked_at, error = await check_website(
+                checker = WebsiteChecker(
                     url,
-                    domain,
-                    session,
-                    proxies,
+                    self.proxy_manager,
                     self.RETRIES_IN_REPEATING_REQUESTS,
                     self.DELAY_WAIT_BEFORE_START_RETRYING,
+                    session=None
                 )
+                url, status, response_time, checked_at, error = await checker.check_website()
+                downtime = calculate_downtime(self.down_since, url)
                 await self.log_status_in_sqlite(url, status, response_time, checked_at)
 
                 if status == 200:
-                    downtime = self._calculate_downtime(url)
-                    success_message = self._create_success_message(url, downtime)
-                    self.telegram_bot.add_to_queue(success_message)
+                    success_message = create_message_site_is_up(url, downtime)
+                    await self.telegram_bot.add_to_queue(success_message)
                     logger.info(f"{url} is back up. Downtime: {downtime}")
                     del self.down_since[url]
-                    break
+                    return
                 else:
-                    error_message = self._create_error_message(url, status, error)
-                    self.telegram_bot.add_to_queue(error_message)
-                    await asyncio.sleep(self.TIME_WAIT_BEFORE_RETRYING + current_wait_time)
-                    current_wait_time += self.DELAY_WAIT_BEFORE_START_RETRYING
-                    logger.info(f"{url} {status} {response_time} {checked_at} {error if error else ''}")
+                    error_message = create_error_message(url, status, error, downtime)
+                    await self.telegram_bot.add_to_queue(error_message)
+                    logger.error(f"{url} {status} {response_time} {error if error else ''}")
 
             except Exception as e:
-                logger.error(f"An error occurred while checking {url}: {str(e)}")
-                exception_message = self._create_exception_message(url, e)
-                self.telegram_bot.add_to_queue(exception_message)
-                await asyncio.sleep(self.TIME_WAIT_BEFORE_RETRYING + current_wait_time)
-                current_wait_time += 5
-        await session.close()
+                await self._send_debug_exception_message(url, e)
 
-    async def process_website_check(self, url, session, proxies):
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc
-        semaphore = self.get_semaphore(domain)
-        async with semaphore:
-            try:
-                url, status, response_time, checked_at, error = await check_website(
-                    url,
-                    domain,
-                    session,
-                    proxies,
-                    self.RETRIES_IN_REPEATING_REQUESTS,
-                    self.DELAY_WAIT_BEFORE_START_RETRYING,
-                )
-                if status != 200:
-                    error_message = self._create_error_message(url, status, error)
-                    self.telegram_bot.add_to_queue(error_message)
-                    if url not in self.down_since:
-                        asyncio.create_task(self.check_site_until_up(url, domain, proxies))
-                await self.log_status_in_sqlite(url, status, response_time, checked_at)
-                logger.info(f"{url} {status} {response_time} {checked_at} {error if error else ''}")
+            await asyncio.sleep(self.TIME_WAIT_BEFORE_RETRYING)
 
-            except Exception as e:
-                logger.error(f"An error occurred while processing {url}: {str(e)}")
-                exception_message = self._create_exception_message(url, e)
-                self.telegram_bot.add_to_queue(exception_message)
+    async def _send_debug_exception_message(self, url: str, e: Exception) -> None:
+        logger.error(f"An error occurred while checking {url}: {str(e)}")
+        exception_message = create_exception_message(url, str(e))
+        await self.telegram_bot.add_to_queue(exception_message)
 
-    def get_ip(self, domain):
-        try:
-            return socket.gethostbyname(domain)
-        except socket.gaierror:
-            return None
-    def get_semaphore(self, domain):
-        ip = self.get_ip(domain)
+    async def get_semaphore(self, url) -> Optional[asyncio.Semaphore]:
+        '''Oграничивает одновременные запросы к 1 ip адресу'''
+        domain = get_domain_from_url(url)
+        ip = await resolve_domain(domain)
         if ip not in self.ip_semaphores:
             self.ip_semaphores[ip] = asyncio.Semaphore(self.LIMIT_REQUEST_IP)
         return self.ip_semaphores[ip]
 
-    async def check_all_websites(self, proxies):
-        session = await create_session(self.POOL_SIZE, self.LIMIT_PER_HOST)
-        tasks = [self.process_website_check(url, session, proxies) for url in self.urls]
-        await asyncio.gather(*tasks)
-        await session.close()
-
-    async def uptime_check(self):
-        proxies = [
-            'https://user166223:uvthsf@166.1.226.194:9640',
-            'https://user166223:uvthsf@213.134.20.24:9640',
-            'https://user166223:uvthsf@46.150.249.116:9640',
-            'https://user166223:uvthsf@31.222.240.62:2262',
-            'https://user166223:uvthsf@194.32.250.217:2262',
-            'https://user166223:uvthsf@31.222.240.200:2262'
-        ]
+    async def uptime_check_cycle(self) -> None:
         while True:
             self.urls = await self.db_connection.get_sites()
-            await self.check_all_websites(proxies)
+            async with await create_session(self.POOL_SIZE,
+                                            self.LIMIT_PER_HOST) as session:
+                await self.send_request_to_all_urls(session)
             await asyncio.sleep(self.INTERVAL_BETWEEN_CHECKING)
 
-    async def main(self):
+    async def send_request_to_all_urls(self, session) -> None:
+        tasks = [self.process_website_check(url, session) for url in self.urls]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def main(self) -> None:
         if self.need_saving_in_local_db:
             await self.db.init_db()
-        asyncio.create_task(self.uptime_check())
+        await self.proxy_manager.initialize()
+        asyncio.create_task(self.uptime_check_cycle())
         await self.telegram_bot.start_polling()
 
 
@@ -202,9 +179,9 @@ if __name__ == '__main__':
         chat_id=CHAT_ID,
         db_connection=db_connection,
         need_saving_in_local_db=False,
-        interval_between_checking=800,
-        time_wait_before_retrying=80,
-        delay_wait_before_start_retrying=35,
+        interval_between_checking=200,#800,
+        time_wait_before_retrying=10,#80,
+        delay_wait_before_start_retrying=10,#35,
         retries_in_repeated_requests=3,
         pool_size=50,
         limit_per_host=1,
