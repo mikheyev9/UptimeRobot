@@ -1,6 +1,7 @@
 import asyncpg
 import os
 import json
+from typing import AsyncGenerator
 
 import asyncio
 from contextlib import asynccontextmanager
@@ -33,13 +34,13 @@ class DBConnection:
         self.pool = None
 
     @staticmethod
-    def _get_backup_path(name):
+    def _get_backup_path(name) -> str:
         current_file_path = os.path.abspath(__file__)
         current_directory = os.path.dirname(current_file_path)
         backup_file_path = os.path.join(current_directory, name)
         return backup_file_path
 
-    async def connect_db(self):
+    async def connect_db(self) -> None:
         for attempt in range(self.retry_attempts):
             try:
                 self.pool = await asyncpg.create_pool(user=self.user,
@@ -47,7 +48,6 @@ class DBConnection:
                                                       host=self.host,
                                                       port=self.port,
                                                       database=self.database)
-                return True
             except (asyncpg.PostgresError, OSError) as e:
                 if attempt < self.retry_attempts - 1:
                     await asyncio.sleep(self.retry_delay)
@@ -56,14 +56,14 @@ class DBConnection:
                     raise ConnectionError("Failed to connect to the database.")
 
     @asynccontextmanager
-    async def get_cursor(self):
+    async def get_cursor(self) -> AsyncGenerator[asyncpg.Connection, None]:
         if not self.pool:
             await self.connect_db()
         async with self.pool.acquire(timeout=30) as connection:
             async with connection.transaction():
                 yield connection
 
-    async def get_sites(self):
+    async def get_sites(self) -> list[str,]:
         if self.use_json:
             return self.load_backup_data()
         try:
@@ -76,7 +76,7 @@ class DBConnection:
             self.logger.error(f"Error fetching sites from the database: {e}")
             return self.load_backup_data()
 
-    async def is_site_check_enabled(self, domain):
+    async def domain_in_production(self, domain) -> bool:
         domain = domain.replace('https://', '').replace('http://', '')
         query = 'SELECT site_check FROM public.tables_sites WHERE name=$1'
         try:
@@ -89,14 +89,14 @@ class DBConnection:
             self.logger.error(f"Error checking site_check for domain {domain}: {e}")
             return False
 
-    def save_backup_data(self, data):
+    def save_backup_data(self, data) -> None:
         try:
             with open(self.backup_file, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             self.logger.error(f"Error saving backup data: {e}")
 
-    def load_backup_data(self):
+    def load_backup_data(self) -> list:
         try:
             with open(self.backup_file, 'r') as f:
                 data = json.load(f)
@@ -104,7 +104,7 @@ class DBConnection:
         except FileNotFoundError:
             return []
 
-    async def close(self):
+    async def close(self) -> None:
         if self.pool:
             await self.pool.close()
 
